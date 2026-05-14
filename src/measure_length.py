@@ -1,0 +1,1 @@
+def estimate_bar_length(),
