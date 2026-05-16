@@ -1,8 +1,82 @@
+# Python virtual environment
 .venv/
-runs/
-outputs/
-**/__pycache__/
-*.pyc
-*.pt
-*.mp4
+venv/
+env/
+ENV/
+.env
+.claude/
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Project-specific ignores
+dataset/                    # Training data (too large for GitHub)
+runs/                       # Training logs and checkpoints
+outputs/                    # Generated output files
+*.mp4                       # Video files
+*.avi                       # Video files
+*.mov                       # Video files
+*.pt                        # PyTorch model weights
+*.pth                       # PyTorch weights
+*.ckpt                      # Checkpoints
+*.h5                        # Keras/HDF5 weights
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# System
 .DS_Store
+Thumbs.db
+*.log
+.env.local
+.env.*.local
+
+# macOS specific
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+$RECYCLE.BIN/
+ehthumbs.db
+desktop.ini
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
