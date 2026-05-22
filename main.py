@@ -1,6 +1,6 @@
 """
 Main entry point for the industrial bar detector application.
-Handles command-line arguments and coordinates video/camera detection.
+Handles command-line arguments and coordinates video/camera detection with tracking.
 """
 
 import argparse
@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.detect_video import detect_video
 from src.detect_camera import detect_camera
+from src.measure_length import METERS_PER_PIXEL, TARGET_BAR_LENGTH_METERS
 
 
 def find_model_path() -> str:
@@ -45,14 +46,16 @@ def find_model_path() -> str:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Industrial Bar Detector - YOLOv8 based steel bar detection system',
+        description='Industrial Bar Detector - YOLOv8 with Object Tracking',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python main.py --video video.mp4
   python main.py --video video.mp4 --output outputs/result.mp4
+  python main.py --video video.mp4 --iou 0.3
   python main.py --camera
   python main.py --camera --model yolov8n.pt
+  python main.py --video video.mp4 --meters-per-pixel 0.006 --iou 0.4
         """
     )
     
@@ -97,6 +100,20 @@ Examples:
     )
     
     parser.add_argument(
+        '--iou',
+        type=float,
+        default=0.45,
+        help='IOU threshold for NMS (default: 0.45). Higher values prevent double detection, lower values allow separate boxes.'
+    )
+    
+    parser.add_argument(
+        '--track-buffer',
+        type=int,
+        default=60,
+        help='ByteTrack memory buffer in frames (default: 60). Higher values remember objects longer during occlusions.'
+    )
+    
+    parser.add_argument(
         '--max-frames',
         type=int,
         default=None,
@@ -106,8 +123,35 @@ Examples:
     parser.add_argument(
         '--pixel-to-cm',
         type=float,
-        default=1.0,
-        help='Calibration factor: pixels to cm (default: 1.0)'
+        default=None,
+        help='Calibration factor: pixels to cm (DEPRECATED: use --meters-per-pixel instead)'
+    )
+    
+    parser.add_argument(
+        '--meters-per-pixel',
+        type=float,
+        default=METERS_PER_PIXEL,
+        help=f'Calibration factor: pixels to meters (default: {METERS_PER_PIXEL})'
+    )
+    
+    parser.add_argument(
+        '--target-length',
+        type=float,
+        default=TARGET_BAR_LENGTH_METERS,
+        help=f'Target bar length in meters (default: {TARGET_BAR_LENGTH_METERS})'
+    )
+    
+    parser.add_argument(
+        '--display',
+        action='store_true',
+        default=True,
+        help='Display live feed during video processing (default: enabled)'
+    )
+    
+    parser.add_argument(
+        '--no-display',
+        action='store_true',
+        help='Disable live feed display'
     )
     
     args = parser.parse_args()
@@ -118,6 +162,9 @@ Examples:
         print("\nError: Please specify either --video or --camera")
         sys.exit(1)
     
+    # Handle display flag
+    display_enabled = args.display and not args.no_display
+    
     try:
         # Find model
         model_path = args.model or find_model_path()
@@ -125,9 +172,9 @@ Examples:
         
         # Video mode
         if args.video:
-            print("=" * 60)
-            print("VIDEO DETECTION MODE")
-            print("=" * 60)
+            print("=" * 70)
+            print("VIDEO DETECTION MODE - LIVE FEED WITH TRACKING")
+            print("=" * 70)
             
             # Validate video file
             if not os.path.exists(args.video):
@@ -137,41 +184,39 @@ Examples:
             # Set default output path if not specified
             output_path = args.output or "outputs/output.mp4"
             
-            # Run detection
+            # Run detection with tracking and configurable IOU
             results = detect_video(
                 video_path=args.video,
                 model_path=model_path,
                 output_path=output_path,
                 confidence_threshold=args.confidence,
-                reference_pixel_to_cm=args.pixel_to_cm
+                meters_per_pixel=args.meters_per_pixel,
+                target_length=args.target_length,
+                iou_threshold=args.iou,
+                track_buffer=args.track_buffer,
+                show_live=display_enabled
             )
             
             # Print results
-            print("\n" + "=" * 60)
-            print("DETECTION RESULTS")
-            print("=" * 60)
+            print("\n" + "=" * 70)
+            print("DETECTION & TRACKING RESULTS")
+            print("=" * 70)
             print(f"Total frames processed: {results['total_frames']}")
-            print(f"Frames with detections: {results['frames_with_detections']}")
             print(f"Total detections: {results['total_detections']}")
-            print(f"Average detections per frame: {results['avg_detections_per_frame']:.2f}")
-            
-            if results['length_stats']['count'] > 0:
-                stats = results['length_stats']
-                print(f"\nBar length statistics (cm):")
-                print(f"  Minimum: {stats['min']:.2f}")
-                print(f"  Maximum: {stats['max']:.2f}")
-                print(f"  Average: {stats['mean']:.2f}")
-                print(f"  Median: {stats['median']:.2f}")
-                print(f"  Total bars measured: {stats['count']}")
-            
+            print(f"Unique tracked IDs: {len(results['unique_track_ids'])}")
+            print(f"Average FPS: {results['fps_avg']:.2f}")
+            print(f"\nTracking Configuration:")
+            print(f"  IOU threshold: {args.iou}")
+            print(f"  Meters per pixel: {args.meters_per_pixel:.6f}")
+            print(f"  Target length: {args.target_length:.2f}m")
             print(f"\nProcessed video saved to: {output_path}")
-            print("=" * 60)
+            print("=" * 70)
         
         # Camera mode
         elif args.camera:
-            print("=" * 60)
-            print("CAMERA DETECTION MODE")
-            print("=" * 60)
+            print("=" * 70)
+            print("CAMERA DETECTION MODE - LIVE FEED")
+            print("=" * 70)
             
             results = detect_camera(
                 model_path=model_path,
@@ -182,14 +227,14 @@ Examples:
             )
             
             # Print results
-            print("\n" + "=" * 60)
+            print("\n" + "=" * 70)
             print("DETECTION RESULTS")
-            print("=" * 60)
+            print("=" * 70)
             print(f"Total frames processed: {results['total_frames']}")
             print(f"Total detections: {results['total_detections']}")
             print(f"Average detections per frame: {results['avg_detections_per_frame']:.2f}")
             print(f"Frames saved: {results['frames_saved']}")
-            print("=" * 60)
+            print("=" * 70)
     
     except FileNotFoundError as e:
         print(f"Error: {e}")

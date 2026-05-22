@@ -10,7 +10,7 @@ __author__ = "Industrial Bar Detection Team"
 
 from src.detect_video import detect_video, VideoDetector
 from src.detect_camera import detect_camera, CameraDetector
-from src.utils import load_yolo_model, draw_bounding_boxes, get_detections
+from src.utils import draw_bounding_boxes, add_header_overlay, get_color_by_id
 from src.measure_length import estimate_bar_length, get_bar_length_stats
 
 __all__ = [
@@ -18,9 +18,9 @@ __all__ = [
     'detect_camera',
     'VideoDetector',
     'CameraDetector',
-    'load_yolo_model',
     'draw_bounding_boxes',
-    'get_detections',
+    'add_header_overlay',
+    'get_color_by_id',
     'estimate_bar_length',
     'get_bar_length_stats',
 ]
