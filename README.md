@@ -70,8 +70,20 @@ pip install -r requirements.txt
   .\.venv\Scripts\activate
   pip install -r requirements.txt
   ```
+- If Windows shows a PyTorch DLL error such as `c10.dll` / `WinError 1114`, install Microsoft Visual C++ Redistributable 2015-2022 x64, then reinstall the CPU build of PyTorch:
+  ```powershell
+  pip uninstall -y torch torchvision torchaudio ultralytics
+  pip cache purge
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+  pip install -r requirements.txt
+  ```
 - Install and start Mosquitto MQTT Broker for Windows, then keep the broker running before launching `main.py`.
 - The code uses `pathlib` for project paths, so both relative paths like `video.mp4` and Windows paths like `C:\path\to\video.mp4` are supported.
+- Inference device selection is automatic by default. For the most reliable presentation setup, force CPU mode:
+  ```powershell
+  python main.py --source video.mp4 --device cpu
+  ```
+- If a CUDA/GPU runtime fails during inference, the detector retries on CPU automatically.
 - Run OpenCV demos from a normal desktop session. `cv2.imshow()` requires a graphical Windows session and will not display correctly in headless terminals or remote shells without GUI forwarding.
 - If another device must open the dashboard stream, allow Python through Windows Firewall for port `8081` and run:
   ```powershell
@@ -80,10 +92,22 @@ pip install -r requirements.txt
 
 ## Usage
 
+Standalone OpenCV demo:
+
+```bash
+python src/detect_video.py --source video.mp4 --loop
+```
+
 Local video:
 
 ```bash
 python main.py --source video.mp4
+```
+
+Force CPU mode:
+
+```bash
+python main.py --source video.mp4 --device cpu
 ```
 
 ESP32 stream:

@@ -8,12 +8,13 @@ import sys
 from pathlib import Path
 from typing import Optional, Dict
 
-from ultralytics import YOLO
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.utils import (
     draw_bounding_boxes,
     add_header_overlay,
+    is_cpu_device,
+    load_model,
+    select_inference_device,
 )
 from src.measure_length import estimate_bar_length
 
@@ -27,7 +28,8 @@ class CameraDetector:
         confidence_threshold: float = 0.4,
         iou_threshold: float = 0.3,
         camera_id: int = 0,
-        meters_per_pixel: float = 0.009890
+        meters_per_pixel: float = 0.009890,
+        device: str = "auto"
     ):
         """
         Initialize the camera detector.
@@ -38,12 +40,48 @@ class CameraDetector:
             iou_threshold: NMS IOU threshold
             camera_id: Camera device ID (0 for default camera)
             meters_per_pixel: Calibration factor for length estimation
+            device: Inference device: auto, cpu, cuda, or a CUDA index such as 0
         """
-        self.model = YOLO(model_path)
+        self.model = load_model(model_path)
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.camera_id = camera_id
         self.meters_per_pixel = meters_per_pixel
+        self.active_device = select_inference_device(device)
+        self._cpu_fallback_warned = False
+
+        print(f"YOLO inference device: {self.active_device}")
+
+    def track_frame(self, frame, tracker: str = "bytetrack.yaml", verbose: bool = False):
+        """Run camera tracking with CPU fallback when CUDA fails at runtime."""
+        try:
+            return self.model.track(
+                frame,
+                conf=self.confidence_threshold,
+                iou=self.iou_threshold,
+                persist=True,
+                tracker=tracker,
+                device=self.active_device,
+                verbose=verbose
+            )
+        except Exception as exc:
+            if is_cpu_device(self.active_device):
+                raise
+
+            if not self._cpu_fallback_warned:
+                print(f"CUDA inference failed ({exc}). Falling back to CPU.")
+                self._cpu_fallback_warned = True
+
+            self.active_device = "cpu"
+            return self.model.track(
+                frame,
+                conf=self.confidence_threshold,
+                iou=self.iou_threshold,
+                persist=True,
+                tracker=tracker,
+                device="cpu",
+                verbose=verbose
+            )
         
     def start_detection(
         self,
@@ -107,11 +145,8 @@ class CameraDetector:
                     break
                 
                 # Run tracking
-                results = self.model.track(
+                results = self.track_frame(
                     frame,
-                    conf=self.confidence_threshold,
-                    iou=self.iou_threshold,
-                    persist=True,
                     tracker='bytetrack.yaml',
                     verbose=False
                 )
@@ -216,7 +251,8 @@ def detect_camera(
     iou_threshold: float = 0.3,
     meters_per_pixel: float = 0.009890,
     target_length: float = 3.0,
-    max_frames: Optional[int] = None
+    max_frames: Optional[int] = None,
+    device: str = "auto"
 ) -> Dict:
     """
     Convenience function for camera detection.
@@ -229,6 +265,7 @@ def detect_camera(
         meters_per_pixel: Calibration factor for length estimation
         target_length: Target bar length in meters
         max_frames: Optional maximum number of frames
+        device: Inference device: auto, cpu, cuda, or a CUDA index such as 0
         
     Returns:
         dict: Detection statistics
@@ -238,6 +275,7 @@ def detect_camera(
         confidence_threshold=confidence_threshold,
         iou_threshold=iou_threshold,
         camera_id=camera_id,
-        meters_per_pixel=meters_per_pixel
+        meters_per_pixel=meters_per_pixel,
+        device=device
     )
     return detector.start_detection(target_length=target_length, max_frames=max_frames)

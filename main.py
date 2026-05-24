@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import signal
+import sys
 import threading
 import time
 from datetime import datetime
@@ -294,6 +295,7 @@ def run(args: argparse.Namespace) -> None:
             track_buffer=args.track_buffer,
             target_length=TARGET_LENGTH_M,
             loop_video=args.loop_video and not is_live_source,
+            device=args.device,
         )
 
         for item in stream:
@@ -346,6 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confidence", type=float, default=0.5, help="YOLO confidence threshold.")
     parser.add_argument("--iou", type=float, default=0.45, help="YOLO NMS IoU threshold.")
     parser.add_argument("--track-buffer", type=int, default=60, help="BoTSORT track buffer.")
+    parser.add_argument("--device", default="auto", help="Inference device: auto, cpu, cuda, or a CUDA index such as 0.")
     parser.add_argument("--mqtt-broker", default="localhost", help="MQTT broker host.")
     parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port.")
     parser.add_argument("--mqtt-topic", default=MQTT_TOPIC, help="MQTT data topic.")
@@ -362,4 +365,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    run(build_parser().parse_args())
+    try:
+        run(build_parser().parse_args())
+    except (RuntimeError, OSError) as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

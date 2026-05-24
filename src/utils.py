@@ -7,6 +7,8 @@ Features:
   - Professional UI with color-coded tracking
 """
 
+import sys
+
 import cv2
 import numpy as np
 from typing import List, Dict, Tuple, Optional
@@ -396,18 +398,75 @@ def add_header_overlay(
     return frame
 
 
+def _torch_setup_error_message(error: BaseException) -> str:
+    """Return a practical setup message for PyTorch/Ultralytics import errors."""
+    base = (
+        "Failed to load PyTorch/Ultralytics. The detector cannot start until "
+        "the local Python environment can import torch correctly."
+    )
+
+    if sys.platform.startswith("win"):
+        return (
+            f"{base}\n\n"
+            f"Original error: {error}\n\n"
+            "Windows recovery steps:\n"
+            "  1. Install Microsoft Visual C++ Redistributable 2015-2022 x64.\n"
+            "  2. Recreate the virtual environment with 64-bit Python 3.10 or 3.11.\n"
+            "  3. For the most reliable presentation setup, install CPU PyTorch:\n"
+            "     pip uninstall -y torch torchvision torchaudio ultralytics\n"
+            "     pip cache purge\n"
+            "     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu\n"
+            "     pip install -r requirements.txt\n"
+            "  4. Run with --device cpu if CUDA is not required."
+        )
+
+    return f"{base}\n\nOriginal error: {error}"
+
+
 def load_model(model_path: str):
     """
-    Load a YOLOv8 model.
-    
-    Args:
-        model_path: Path to model weights file
-        
-    Returns:
-        YOLO: Loaded model object
+    Load a YOLOv8 model lazily.
+
+    The ultralytics import pulls in PyTorch. Keeping it inside this function lets
+    CLI help and non-detection imports work even if the Windows torch DLL setup
+    still needs to be fixed.
     """
-    from ultralytics import YOLO
+    try:
+        from ultralytics import YOLO
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(_torch_setup_error_message(exc)) from exc
+
     return YOLO(model_path)
+
+
+def select_inference_device(requested_device: str = "auto"):
+    """
+    Select a YOLO inference device.
+
+    Returns a value accepted by Ultralytics: "cpu", an integer CUDA device such
+    as 0, or a user-provided device string.
+    """
+    requested = str(requested_device or "auto").strip().lower()
+
+    if requested == "auto":
+        try:
+            import torch
+            return 0 if torch.cuda.is_available() else "cpu"
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(_torch_setup_error_message(exc)) from exc
+
+    if requested in {"cpu", "mps"}:
+        return requested
+    if requested in {"cuda", "gpu"}:
+        return 0
+    if requested.isdigit():
+        return int(requested)
+    return requested
+
+
+def is_cpu_device(device) -> bool:
+    """Return True when the selected YOLO device is CPU."""
+    return str(device).strip().lower() == "cpu"
 
 
 def get_frame_info(frame: np.ndarray) -> Dict:

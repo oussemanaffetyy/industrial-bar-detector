@@ -13,16 +13,17 @@ import sys
 from pathlib import Path
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
-from ultralytics import YOLO
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.utils import (
     draw_bounding_boxes,
     add_header_overlay,
-    get_color_by_id
+    is_cpu_device,
+    load_model,
+    select_inference_device,
 )
 from src.measure_length import (
     estimate_bar_length,
@@ -192,7 +193,8 @@ class VideoDetector:
         track_buffer: int = 60,  # Increased from default 30 to remember objects longer
         meters_per_pixel: float = 0.009890,
         target_length: float = 3.0,
-        roi_ignore_percent: float = 0.20  # Ignore top 20% (furnace area)
+        roi_ignore_percent: float = 0.20,  # Ignore top 20% (furnace area)
+        device: str = "auto"
     ):
         """
         Initialize video detector with YOLOv8 model.
@@ -205,14 +207,18 @@ class VideoDetector:
             meters_per_pixel: Calibration factor
             target_length: Target bar length in meters
             roi_ignore_percent: Fraction of top frame to ignore (furnace)
+            device: Inference device: auto, cpu, cuda, or a CUDA index such as 0
         """
-        self.model = YOLO(model_path)
+        self.model = load_model(model_path)
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.track_buffer = track_buffer
         self.meters_per_pixel = meters_per_pixel
         self.target_length = target_length
         self.roi_ignore_percent = roi_ignore_percent
+        self.requested_device = device
+        self.active_device = select_inference_device(device)
+        self._cpu_fallback_warned = False
         
         self.motion_tracker = MotionTracker()
         self.length_smoother = LengthSmoother(window_size=30)
@@ -220,6 +226,45 @@ class VideoDetector:
         self.max_id = 0
         self.roi_config = None
         self.frame_height = None
+        self.frame_width = None
+
+        print(f"YOLO inference device: {self.active_device}")
+
+    def track_frame(self, frame, tracker: str = "botsort.yaml", verbose: bool = False):
+        """
+        Run YOLO tracking with CPU fallback when a CUDA device fails at runtime.
+
+        This does not hide dependency installation problems: if PyTorch itself
+        cannot import, load_model() raises a clear setup error before this point.
+        """
+        try:
+            return self.model.track(
+                frame,
+                conf=self.confidence_threshold,
+                iou=self.iou_threshold,
+                persist=True,
+                tracker=tracker,
+                device=self.active_device,
+                verbose=verbose,
+            )
+        except Exception as exc:
+            if is_cpu_device(self.active_device):
+                raise
+
+            if not self._cpu_fallback_warned:
+                print(f"CUDA inference failed ({exc}). Falling back to CPU.")
+                self._cpu_fallback_warned = True
+
+            self.active_device = "cpu"
+            return self.model.track(
+                frame,
+                conf=self.confidence_threshold,
+                iou=self.iou_threshold,
+                persist=True,
+                tracker=tracker,
+                device="cpu",
+                verbose=verbose,
+            )
     
     def process_video(
         self,
@@ -297,13 +342,10 @@ class VideoDetector:
                 
                 # Run YOLOv8 tracking with improved settings
                 # Using BoTSORT for better stationary object tracking and occlusion handling
-                results = self.model.track(
+                results = self.track_frame(
                     frame,
-                    conf=self.confidence_threshold,
-                    iou=self.iou_threshold,  # 0.45 prevents double detection
-                    persist=True,
                     tracker='botsort.yaml',  # UPGRADED: BoTSORT better for stationary objects
-                    device=0 if self._has_cuda() else 'cpu'
+                    verbose=False
                 )
                 
                 detections = self.get_detections(results, frame.shape)
@@ -448,16 +490,6 @@ class VideoDetector:
         
         return detections
     
-    @staticmethod
-    def _has_cuda() -> bool:
-        """Check if CUDA is available."""
-        try:
-            import torch
-            return torch.cuda.is_available()
-        except:
-            return False
-
-
 def detect_video(
     video_path: str,
     model_path: str,
@@ -467,7 +499,8 @@ def detect_video(
     track_buffer: int = 60,  # Extended buffer
     meters_per_pixel: float = 0.009890,
     target_length: float = 3.0,
-    show_live: bool = True
+    show_live: bool = True,
+    device: str = "auto"
 ) -> Dict:
     """
     High-level function to run video detection.
@@ -482,6 +515,7 @@ def detect_video(
         meters_per_pixel: Calibration factor
         target_length: Target bar length in meters
         show_live: Display live feed during processing
+        device: Inference device: auto, cpu, cuda, or a CUDA index such as 0
         
     Returns:
         Dict: Processing statistics
@@ -492,7 +526,8 @@ def detect_video(
         iou_threshold=iou_threshold,
         track_buffer=track_buffer,
         meters_per_pixel=meters_per_pixel,
-        target_length=target_length
+        target_length=target_length,
+        device=device
     )
     
     return detector.process_video(video_path, output_path, show_live=show_live)
@@ -507,6 +542,7 @@ def detect_video_stream(
     meters_per_pixel: float = None,
     target_length: float = 3.0,
     loop_video: bool = False,
+    device: str = "auto",
 ):
     """
     Generator function for real-time video detection streaming.
@@ -522,6 +558,7 @@ def detect_video_stream(
         meters_per_pixel: Calibration factor (auto-calculated if None)
         target_length: Target bar length in meters
         loop_video: Restart file sources when the end is reached
+        device: Inference device: auto, cpu, cuda, or a CUDA index such as 0
         
     Yields:
         Dict: Frame, detections, ROI metadata, and FPS for the current frame
@@ -538,7 +575,8 @@ def detect_video_stream(
             iou_threshold=iou_threshold,
             track_buffer=track_buffer,
             meters_per_pixel=meters_per_pixel or 0.009890,
-            target_length=target_length
+            target_length=target_length,
+            device=device
         )
         
         frame_idx = 0
@@ -574,13 +612,9 @@ def detect_video_stream(
                 roi_initialized = True
             
             frame_h, frame_w = frame.shape[:2]
-            results = detector.model.track(
+            results = detector.track_frame(
                 frame,
-                conf=detector.confidence_threshold,
-                iou=detector.iou_threshold,
                 tracker="botsort.yaml",
-                persist=True,
-                device=0 if detector._has_cuda() else 'cpu',
                 verbose=False
             )
             
@@ -638,6 +672,7 @@ def detect_video_stream(
     
     except Exception as e:
         print(f"Error in detect_video_stream: {e}")
+        raise
     finally:
         if cap is not None:
             cap.release()
@@ -714,7 +749,8 @@ def run_standalone_demo(args) -> None:
             iou_threshold=args.iou,
             track_buffer=args.track_buffer,
             target_length=args.target_length,
-            loop_video=args.loop
+            loop_video=args.loop,
+            device=args.device
         ):
             detections = item['detections']
             frame = draw_bounding_boxes(
@@ -757,10 +793,15 @@ def build_standalone_parser():
     parser.add_argument("--iou", type=float, default=0.45, help="YOLO NMS IoU threshold.")
     parser.add_argument("--track-buffer", type=int, default=60, help="BoTSORT track buffer.")
     parser.add_argument("--target-length", type=float, default=3.0, help="Cut target length in meters.")
+    parser.add_argument("--device", default="auto", help="Inference device: auto, cpu, cuda, or a CUDA index such as 0.")
     parser.add_argument("--delay", type=int, default=1, help="cv2.waitKey delay in milliseconds.")
     parser.add_argument("--loop", action="store_true", help="Loop local video files for presentation demos.")
     return parser
 
 
 if __name__ == "__main__":
-    run_standalone_demo(build_standalone_parser().parse_args())
+    try:
+        run_standalone_demo(build_standalone_parser().parse_args())
+    except (RuntimeError, OSError) as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
