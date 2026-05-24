@@ -28,7 +28,7 @@ Video / ESP32 Stream
 - MJPEG annotated video stream for dashboard display
 - MQTT JSON publishing to `factory/bars/data`
 - Local video and ESP32 camera stream support
-- Passive FlowFuse dashboard integration via `flows.json`
+- Passive FlowFuse dashboard integration via `nodered.json`
 
 ## Prerequisites
 
@@ -129,7 +129,7 @@ The Python service publishes:
 
 ## FlowFuse / Node-RED
 
-Import `flows.json` into Node-RED / FlowFuse. The dashboard is passive and displays the `streamUrl`, active detections, cut alert, FPS, and history data published by `main.py`.
+Import `nodered.json` into Node-RED / FlowFuse. The dashboard is passive and displays the `streamUrl`, active detections, cut alert, FPS, and history data published by `main.py`.
 
 ## Repository Structure
 
@@ -137,7 +137,7 @@ Import `flows.json` into Node-RED / FlowFuse. The dashboard is passive and displ
 .
 ├── main.py
 ├── requirements.txt
-├── flows.json
+├── nodered.json
 ├── models/
 │   └── best.pt
 └── src/
