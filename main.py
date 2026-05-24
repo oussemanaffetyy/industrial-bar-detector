@@ -36,6 +36,12 @@ DEFAULT_SOURCE = PROJECT_ROOT / "video.mp4"
 MQTT_TOPIC = "factory/bars/data"
 TARGET_LENGTH_M = 3.0
 URL_SCHEMES = {"http", "https", "rtsp", "rtmp", "udp", "tcp"}
+CLIENT_DISCONNECT_ERRORS = (
+    BrokenPipeError,
+    ConnectionAbortedError,
+    ConnectionResetError,
+    TimeoutError,
+)
 
 
 class FrameStore:
@@ -94,12 +100,15 @@ def make_mjpeg_handler(store: FrameStore):
                 self.send_error(404, "Use /stream")
                 return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-            self.send_header("Cache-Control", "no-cache, private")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-cache, private")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+            except CLIENT_DISCONNECT_ERRORS:
+                return
 
             last_sequence = -1
             while not self.server.stop_event.is_set():  # type: ignore[attr-defined]
@@ -113,7 +122,7 @@ def make_mjpeg_handler(store: FrameStore):
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
                     self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii"))
                     self.wfile.write(jpeg + b"\r\n")
-                except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                except CLIENT_DISCONNECT_ERRORS:
                     break
 
     return Handler
@@ -133,19 +142,29 @@ class MqttPublisher:
     def _new_client(client_id: str) -> mqtt.Client:
         if hasattr(mqtt, "CallbackAPIVersion"):
             return mqtt.Client(
-                callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                 client_id=client_id,
             )
         return mqtt.Client(client_id=client_id)
 
-    def _on_connect(self, client, userdata, flags, rc) -> None:
-        self.connected = rc == 0
+    @staticmethod
+    def _is_success_reason(reason_code: Any) -> bool:
+        if hasattr(reason_code, "is_failure"):
+            return not reason_code.is_failure
+        try:
+            return int(reason_code) == 0
+        except (TypeError, ValueError):
+            return str(reason_code).lower() in {"0", "success", "normal disconnection"}
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        self.connected = self._is_success_reason(reason_code)
         print(f"MQTT {'connected' if self.connected else 'connection failed'}: {self.broker}:{self.port}")
 
-    def _on_disconnect(self, client, userdata, rc) -> None:
+    def _on_disconnect(self, client, userdata, *args) -> None:
         self.connected = False
-        if rc:
-            print(f"MQTT disconnected with code {rc}")
+        reason_code = args[1] if len(args) >= 3 else args[0] if args else 0
+        if not self._is_success_reason(reason_code):
+            print(f"MQTT disconnected with code {reason_code}")
 
     def start(self) -> None:
         self.client.reconnect_delay_set(min_delay=1, max_delay=10)

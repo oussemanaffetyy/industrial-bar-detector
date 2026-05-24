@@ -78,6 +78,18 @@ pip install -r requirements.txt
   pip install -r requirements.txt
   ```
 - Install and start Mosquitto MQTT Broker for Windows, then keep the broker running before launching `main.py`.
+- Check that Mosquitto is reachable before starting Node-RED:
+  ```powershell
+  Test-NetConnection localhost -Port 1883
+  ```
+  If the test fails, start the Mosquitto service from an Administrator PowerShell:
+  ```powershell
+  Start-Service mosquitto
+  ```
+  Or run Mosquitto directly:
+  ```powershell
+  & "C:\Program Files\mosquitto\mosquitto.exe" -v
+  ```
 - The code uses `pathlib` for project paths, so both relative paths like `video.mp4` and Windows paths like `C:\path\to\video.mp4` are supported.
 - Inference device selection is automatic by default. For the most reliable presentation setup, force CPU mode:
   ```powershell
