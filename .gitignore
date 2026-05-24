@@ -36,16 +36,21 @@ htmlcov/
 .tox/
 
 # Project-specific ignores
-dataset/                    # Training data (too large for GitHub)
-runs/                       # Training logs and checkpoints
-outputs/                    # Generated output files
-*.mp4                       # Video files
-*.avi                       # Video files
-*.mov                       # Video files
-*.pt                        # PyTorch model weights
-*.pth                       # PyTorch weights
-*.ckpt                      # Checkpoints
-*.h5                        # Keras/HDF5 weights
+# Training data and generated artifacts are too large/noisy for GitHub.
+dataset/
+runs/
+outputs/
+
+# Video files
+*.mp4
+*.avi
+*.mov
+
+# Model checkpoints from training runs remain ignored by runs/.
+# Keep models/best.pt versioned for out-of-the-box inference.
+*.pth
+*.ckpt
+*.h5
 
 # IDE and Editor
 .vscode/

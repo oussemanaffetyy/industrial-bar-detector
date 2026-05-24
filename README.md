@@ -1,230 +1,131 @@
-# Industrial Bar Detector
+# Industrial Steel Bar Detector (El Fouladh Steel Plant)
 
-A production-ready YOLOv8-based steel bar detection system that processes videos and camera feeds to detect, annotate, and measure steel bars in real-time.
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
+![YOLOv8](https://img.shields.io/badge/YOLOv8-Ultralytics-111111)
+![MQTT](https://img.shields.io/badge/MQTT-Mosquitto-660066)
+![Dashboard](https://img.shields.io/badge/Dashboard-FlowFuse%20Vue.js-009688)
 
-## Overview
+Master's PFE end-of-studies project for real-time industrial steel bar detection, tracking, length monitoring, and supervision at the El Fouladh steel plant.
 
-This project implements a complete pipeline for detecting industrial steel bars using YOLOv8 object detection. It supports:
+The system detects steel bars with YOLOv8, tracks them with BoTSORT, monitors the 3.00 m cutting target, serves annotated video through an MJPEG HTTP stream, and publishes live production state to a FlowFuse / Node-RED Vue.js dashboard over MQTT.
 
-- **Video processing**: Detect bars in video files and save annotated output
-- **Real-time detection**: Live camera feed processing with webcam support
-- **Measurement**: Estimate bar lengths from bounding boxes with calibration support
-- **Statistics**: Comprehensive detection metrics and analysis
+## Architecture
+
+```text
+Video / ESP32 Stream
+  -> YOLOv8 + BoTSORT
+  -> Length Measurement + Smoothing
+  -> MJPEG HTTP Stream: http://<host>:8081/stream
+  -> MQTT Topic: factory/bars/data
+  -> FlowFuse / Node-RED Vue.js Dashboard
+```
 
 ## Features
 
-✅ YOLOv8 model loading with auto-detection  
-✅ Frame-by-frame video processing  
-✅ Real-time bounding box visualization  
-✅ Confidence score display  
-✅ Bar length estimation with calibration  
-✅ Statistical analysis (min/max/mean/median)  
-✅ MP4 video output with original quality  
-✅ Modular, production-grade code  
-✅ Comprehensive error handling  
+- YOLOv8 inference with the included model: `models/best.pt`
+- BoTSORT tracking for stable steel bar IDs
+- 3.00 m target-length cut alert generation
+- MJPEG annotated video stream for dashboard display
+- MQTT JSON publishing to `factory/bars/data`
+- Local video and ESP32 camera stream support
+- Passive FlowFuse dashboard integration via `flows.json`
 
-## Project Structure
+## Prerequisites
 
-```
-industrial-bar-detector/
-├── src/
-│   ├── __init__.py              # Module initialization
-│   ├── utils.py                 # Core utilities (model loading, visualization)
-│   ├── detect_video.py          # Video detection pipeline
-│   ├── detect_camera.py         # Real-time camera detection
-│   └── measure_length.py        # Bar length estimation
-├── main.py                      # CLI entry point
-├── requirements.txt             # Python dependencies
-├── models/
-│   └── best.pt                  # Trained YOLOv8 model
-├── dataset/                     # Training dataset
-├── runs/                        # Training checkpoints & results
-└── outputs/                     # Generated video output (git-ignored)
-```
+- Python 3.9+
+- Mosquitto MQTT Broker
+- Node-RED / FlowFuse Dashboard
+- Local video file or ESP32 camera stream
 
-## Setup
+macOS Mosquitto setup:
 
-### Prerequisites
-
-- Python 3.8+
-- Virtual environment (recommended)
-
-### Installation
-
-1. Clone the repository:
 ```bash
-git clone https://github.com/oussemanaffetyy/industrial-bar-detector.git
-cd industrial-bar-detector
+brew install mosquitto
+brew services start mosquitto
 ```
 
-2. Create virtual environment:
+Debian/Ubuntu Mosquitto setup:
+
 ```bash
+sudo apt update
+sudo apt install mosquitto mosquitto-clients
+sudo systemctl enable --now mosquitto
+```
+
+## Installation
+
+```bash
+git clone <repository-url>
+cd <repository-folder>
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Windows Compatibility Checklist
+
+- Create a fresh Windows virtual environment:
+  ```powershell
+  python -m venv .venv
+  .\.venv\Scripts\activate
+  pip install -r requirements.txt
+  ```
+- Install and start Mosquitto MQTT Broker for Windows, then keep the broker running before launching `main.py`.
+- The code uses `pathlib` for project paths, so both relative paths like `video.mp4` and Windows paths like `C:\path\to\video.mp4` are supported.
+- Run OpenCV demos from a normal desktop session. `cv2.imshow()` requires a graphical Windows session and will not display correctly in headless terminals or remote shells without GUI forwarding.
+- If another device must open the dashboard stream, allow Python through Windows Firewall for port `8081` and run:
+  ```powershell
+  python main.py --source video.mp4 --stream-public-host <windows-pc-ip>
+  ```
+
 ## Usage
 
-### Video Detection
-
-Process a video file and save annotated output:
+Local video:
 
 ```bash
-python main.py --video video.mp4
+python main.py --source video.mp4
 ```
 
-This will:
-- Load the trained model
-- Process all video frames
-- Draw bounding boxes with confidence scores
-- Estimate bar lengths
-- Save annotated video to `outputs/output.mp4`
-- Display detection statistics
-
-### Custom Output Path
+ESP32 stream:
 
 ```bash
-python main.py --video video.mp4 --output results/processed.mp4
+python main.py --source http://<esp32-ip>:81/stream
 ```
 
-### Adjust Confidence Threshold
+Remote dashboard access:
 
 ```bash
-python main.py --video video.mp4 --confidence 0.7
+python main.py --source video.mp4 --stream-public-host <python-host-ip>
 ```
 
-### Specify Model
+The Python service publishes:
 
-```bash
-python main.py --video video.mp4 --model yolov8n.pt
+- MJPEG stream: `http://<python-host-ip>:8081/stream`
+- MQTT state: `factory/bars/data`
+
+## FlowFuse / Node-RED
+
+Import `flows.json` into Node-RED / FlowFuse. The dashboard is passive and displays the `streamUrl`, active detections, cut alert, FPS, and history data published by `main.py`.
+
+## Repository Structure
+
+```text
+.
+├── main.py
+├── requirements.txt
+├── flows.json
+├── models/
+│   └── best.pt
+└── src/
+    ├── __init__.py
+    ├── detect_camera.py
+    ├── detect_video.py
+    ├── measure_length.py
+    └── utils.py
 ```
 
-### Real-time Camera Detection
+## Notes
 
-```bash
-python main.py --camera
-```
-
-Press:
-- `q` to quit
-- `s` to save current frame with detections
-
-### Calibrated Length Measurement
-
-```bash
-python main.py --video video.mp4 --pixel-to-cm 0.5
-```
-
-Adjust `--pixel-to-cm` based on camera calibration for accurate measurements.
-
-### All Options
-
-```bash
-python main.py --help
-```
-
-## Output
-
-The tool generates:
-
-- **Annotated video** with bounding boxes and confidence scores
-- **Detection statistics** including:
-  - Total frames processed
-  - Number of detections per frame
-  - Bar length ranges (min/max/mean/median)
-  - Frame count with detections
-
-Example output:
-```
-Total frames processed: 6289
-Frames with detections: 6289
-Total detections: 16963
-Average detections per frame: 2.70
-
-Bar length statistics (cm):
-  Minimum: 85.15
-  Maximum: 471.99
-  Average: 245.41
-  Median: 227.47
-```
-
-## API Usage
-
-Use the modules in your own code:
-
-```python
-from src.detect_video import detect_video
-
-results = detect_video(
-    video_path='input.mp4',
-    model_path='models/best.pt',
-    output_path='output.mp4',
-    confidence_threshold=0.5
-)
-
-print(f"Detections: {results['total_detections']}")
-print(f"Average length: {results['length_stats']['mean']:.2f} cm")
-```
-
-## Dependencies
-
-- `ultralytics` (8.4.50+) - YOLOv8 framework
-- `opencv-python` (4.8.0+) - Video and image processing
-- `numpy` (1.26.0+) - Numerical computations
-
-## Future Improvements
-
-1. **Batch processing** - Process multiple videos at once
-2. **Result export** - Save detections as JSON/CSV
-3. **Performance optimization** - Model quantization, batch inference
-4. **Web API** - Flask/FastAPI integration for cloud deployment
-5. **GPU optimization** - Memory-efficient processing for long videos
-6. **Multi-model support** - Switch between different detection models
-7. **Custom training** - Fine-tune on new datasets
-8. **Detection filtering** - Advanced confidence and size-based filtering
-
-## Performance
-
-Tested on:
-- Video: 1280x720 @ 26 FPS, 6289 frames (34 MB input)
-- Model: YOLOv8 custom trained (5.9 MB)
-- Output: Full resolution MP4 (280 MB)
-- Detections: 16,963 bars (2.7 per frame)
-
-## Troubleshooting
-
-### "No model found"
-Ensure `models/best.pt` exists or use `--model` to specify a path.
-
-### "Failed to open video"
-Check that the video file exists and is readable.
-
-### "Camera not available"
-Verify your camera is connected and accessible to Python.
-
-### Slow processing
-For faster processing, try:
-- Lower resolution input
-- Higher confidence threshold
-- Smaller model (yolov8n.pt)
-
-## License
-
-This project is open source and available under the MIT License.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
-
-## Authors
-
-Industrial Bar Detection Team
-
----
-
-**Ready for production use.** For questions or support, please open an issue on GitHub.
+- `models/best.pt` is committed so the project works immediately after cloning.
+- `outputs/`, `runs/`, and video files are ignored by Git.
+- This repository is production/inference focused; training scripts and generated experiment files are excluded.

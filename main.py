@@ -1,253 +1,365 @@
 """
-Main entry point for the industrial bar detector application.
-Handles command-line arguments and coordinates video/camera detection with tracking.
+Industrial Steel Bar Detector - IoT entry point.
+
+This file intentionally contains no YOLO tracking or length-measurement logic.
+Detection is provided by src.detect_video.detect_video_stream(); this module only:
+
+  - reads CLI configuration,
+  - serves annotated frames as MJPEG,
+  - publishes dashboard JSON to MQTT.
 """
 
+from __future__ import annotations
+
 import argparse
-import os
-import sys
+import json
+import signal
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
-# Add src directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+import cv2
+import paho.mqtt.client as mqtt
 
-from src.detect_video import detect_video
-from src.detect_camera import detect_camera
-from src.measure_length import METERS_PER_PIXEL, TARGET_BAR_LENGTH_METERS
-
-
-def find_model_path() -> str:
-    """
-    Find the best available model file.
-    Prefers models/best.pt, falls back to yolov8n.pt
-    
-    Returns:
-        str: Path to model file
-        
-    Raises:
-        FileNotFoundError: If no model file is found
-    """
-    # Priority order for models
-    candidates = [
-        "models/best.pt"
-        
-    ]
-    
-    for model_path in candidates:
-        if os.path.exists(model_path):
-            print(f"Found model: {model_path}")
-            return model_path
-    
-    raise FileNotFoundError(
-        "No YOLOv8 model found. Expected one of: " + ", ".join(candidates)
-    )
+from src.detect_video import detect_video_stream
+from src.utils import add_header_overlay, draw_bounding_boxes
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description='Industrial Bar Detector - YOLOv8 with Object Tracking',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py --video video.mp4
-  python main.py --video video.mp4 --output outputs/result.mp4
-  python main.py --video video.mp4 --iou 0.3
-  python main.py --camera
-  python main.py --camera --model yolov8n.pt
-  python main.py --video video.mp4 --meters-per-pixel 0.006 --iou 0.4
-        """
-    )
-    
-    parser.add_argument(
-        '--video',
-        type=str,
-        help='Path to input video file for detection'
-    )
-    
-    parser.add_argument(
-        '--camera',
-        action='store_true',
-        help='Use webcam for real-time detection (default camera ID: 0)'
-    )
-    
-    parser.add_argument(
-        '--camera-id',
-        type=int,
-        default=0,
-        help='Camera device ID (default: 0)'
-    )
-    
-    parser.add_argument(
-        '--model',
-        type=str,
-        default=None,
-        help='Path to YOLOv8 model file (default: auto-detect best.pt or yolov8n.pt)'
-    )
-    
-    parser.add_argument(
-        '--output',
-        type=str,
-        default=None,
-        help='Path to save processed video (for video mode)'
-    )
-    
-    parser.add_argument(
-        '--confidence',
-        type=float,
-        default=0.5,
-        help='Confidence threshold for detections (default: 0.5)'
-    )
-    
-    parser.add_argument(
-        '--iou',
-        type=float,
-        default=0.45,
-        help='IOU threshold for NMS (default: 0.45). Higher values prevent double detection, lower values allow separate boxes.'
-    )
-    
-    parser.add_argument(
-        '--track-buffer',
-        type=int,
-        default=60,
-        help='ByteTrack memory buffer in frames (default: 60). Higher values remember objects longer during occlusions.'
-    )
-    
-    parser.add_argument(
-        '--max-frames',
-        type=int,
-        default=None,
-        help='Maximum number of frames to process (for camera mode)'
-    )
-    
-    parser.add_argument(
-        '--pixel-to-cm',
-        type=float,
-        default=None,
-        help='Calibration factor: pixels to cm (DEPRECATED: use --meters-per-pixel instead)'
-    )
-    
-    parser.add_argument(
-        '--meters-per-pixel',
-        type=float,
-        default=METERS_PER_PIXEL,
-        help=f'Calibration factor: pixels to meters (default: {METERS_PER_PIXEL})'
-    )
-    
-    parser.add_argument(
-        '--target-length',
-        type=float,
-        default=TARGET_BAR_LENGTH_METERS,
-        help=f'Target bar length in meters (default: {TARGET_BAR_LENGTH_METERS})'
-    )
-    
-    parser.add_argument(
-        '--display',
-        action='store_true',
-        default=True,
-        help='Display live feed during video processing (default: enabled)'
-    )
-    
-    parser.add_argument(
-        '--no-display',
-        action='store_true',
-        help='Disable live feed display'
-    )
-    
-    args = parser.parse_args()
-    
-    # Validate arguments
-    if not args.video and not args.camera:
-        parser.print_help()
-        print("\nError: Please specify either --video or --camera")
-        sys.exit(1)
-    
-    # Handle display flag
-    display_enabled = args.display and not args.no_display
-    
+PROJECT_ROOT = Path(__file__).parent.resolve()
+DEFAULT_MODEL = PROJECT_ROOT / "models" / "best.pt"
+DEFAULT_SOURCE = PROJECT_ROOT / "video.mp4"
+MQTT_TOPIC = "factory/bars/data"
+TARGET_LENGTH_M = 3.0
+URL_SCHEMES = {"http", "https", "rtsp", "rtmp", "udp", "tcp"}
+
+
+class FrameStore:
+    """Thread-safe store for the latest JPEG frame."""
+
+    def __init__(self, quality: int = 85):
+        self.quality = quality
+        self.condition = threading.Condition()
+        self.jpeg: Optional[bytes] = None
+        self.sequence = 0
+
+    def update(self, frame) -> None:
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
+        )
+        if not ok:
+            return
+
+        with self.condition:
+            self.jpeg = encoded.tobytes()
+            self.sequence += 1
+            self.condition.notify_all()
+
+    def wait(self, last_sequence: int) -> Tuple[Optional[bytes], int]:
+        with self.condition:
+            if self.sequence == last_sequence:
+                self.condition.wait(timeout=2.0)
+            return self.jpeg, self.sequence
+
+
+class MjpegServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address, handler, stop_event: threading.Event):
+        super().__init__(address, handler)
+        self.stop_event = stop_event
+
+
+def make_mjpeg_handler(store: FrameStore):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path in {"/", "/health"}:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK. Stream is available at /stream\n")
+                return
+
+            if self.path != "/stream":
+                self.send_error(404, "Use /stream")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            last_sequence = -1
+            while not self.server.stop_event.is_set():  # type: ignore[attr-defined]
+                jpeg, sequence = store.wait(last_sequence)
+                if jpeg is None or sequence == last_sequence:
+                    continue
+
+                last_sequence = sequence
+                try:
+                    self.wfile.write(b"--frame\r\n")
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii"))
+                    self.wfile.write(jpeg + b"\r\n")
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                    break
+
+    return Handler
+
+
+class MqttPublisher:
+    def __init__(self, broker: str, port: int, topic: str, client_id: str):
+        self.topic = topic
+        self.connected = False
+        self.client = self._new_client(client_id)
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+        self.broker = broker
+        self.port = port
+
+    @staticmethod
+    def _new_client(client_id: str) -> mqtt.Client:
+        if hasattr(mqtt, "CallbackAPIVersion"):
+            return mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+                client_id=client_id,
+            )
+        return mqtt.Client(client_id=client_id)
+
+    def _on_connect(self, client, userdata, flags, rc) -> None:
+        self.connected = rc == 0
+        print(f"MQTT {'connected' if self.connected else 'connection failed'}: {self.broker}:{self.port}")
+
+    def _on_disconnect(self, client, userdata, rc) -> None:
+        self.connected = False
+        if rc:
+            print(f"MQTT disconnected with code {rc}")
+
+    def start(self) -> None:
+        self.client.reconnect_delay_set(min_delay=1, max_delay=10)
+        self.client.connect_async(self.broker, self.port, keepalive=60)
+        self.client.loop_start()
+
+    def publish(self, payload: Dict[str, Any]) -> None:
+        if self.connected:
+            self.client.publish(
+                self.topic,
+                json.dumps(payload, separators=(",", ":")),
+                qos=1,
+                retain=False,
+            )
+
+    def stop(self) -> None:
+        self.client.loop_stop()
+        self.client.disconnect()
+
+
+class DashboardState:
+    def __init__(self, stream_url: str, target_length: float = TARGET_LENGTH_M):
+        self.stream_url = stream_url
+        self.target_length = round(target_length, 2)
+        self.history: List[Dict[str, Any]] = []
+        self.cut_emitted_ids: set[int] = set()
+
+    def reset_cut_edges(self) -> None:
+        self.cut_emitted_ids.clear()
+
+    def payload(self, detections: List[Dict[str, Any]], fps: float, mqtt_connected: bool) -> Dict[str, Any]:
+        now = datetime.now()
+        active_bars = []
+        cut_event = None
+
+        for det in detections:
+            track_id = det.get("track_id")
+            if track_id is None:
+                continue
+
+            length = round(float(det.get("smoothed_length_m") or det.get("estimated_length_m") or 0.0), 2)
+            active_bars.append(
+                {
+                    "id": int(track_id),
+                    "length": length,
+                    "confidence": round(float(det.get("confidence", 0.0)), 3),
+                    "motion": det.get("motion_state", "Unknown"),
+                }
+            )
+
+            if length == self.target_length and int(track_id) not in self.cut_emitted_ids:
+                self.cut_emitted_ids.add(int(track_id))
+                cut_event = {
+                    "id": int(track_id),
+                    "length": self.target_length,
+                    "date": now.strftime("%d/%m/%Y"),
+                    "time": now.strftime("%H:%M:%S"),
+                    "timestamp": now.isoformat(timespec="seconds"),
+                    "command": "CUT",
+                }
+                self.history.insert(0, cut_event)
+                self.history = self.history[:100]
+
+        return {
+            "active_count": len(active_bars),
+            "active_bars": active_bars,
+            "history": self.history,
+            "cut_signal": cut_event is not None,
+            "cut_event": cut_event,
+            "target_length": self.target_length,
+            "fps": round(fps, 1),
+            "status": "RUNNING",
+            "mqtt_connected": mqtt_connected,
+            "streamUrl": self.stream_url,
+            "timestamp": now.isoformat(timespec="seconds"),
+        }
+
+
+def is_url(value: str) -> bool:
+    return urlparse(value).scheme.lower() in URL_SCHEMES
+
+
+def resolve_path(value: Union[str, Path]) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def resolve_source(value: str) -> Tuple[Union[int, str], bool]:
+    if value.isdigit():
+        return int(value), True
+    if is_url(value):
+        return value, True
+
+    path = resolve_path(value)
+    if not path.exists():
+        raise FileNotFoundError(f"Source not found: {path}")
+    return str(path), False
+
+
+def public_stream_url(args: argparse.Namespace) -> str:
+    if args.stream_url:
+        return args.stream_url
+
+    host = args.stream_public_host
+    if not host:
+        host = "127.0.0.1" if args.stream_host in {"", "0.0.0.0", "::"} else args.stream_host
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{args.stream_port}/stream"
+
+
+def run(args: argparse.Namespace) -> None:
+    model_path = resolve_path(args.model)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    source, is_live_source = resolve_source(args.source)
+    stream_url = public_stream_url(args)
+    stop_event = threading.Event()
+
+    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+
+    frame_store = FrameStore(args.jpeg_quality)
+    server = MjpegServer((args.stream_host, args.stream_port), make_mjpeg_handler(frame_store), stop_event)
+    threading.Thread(target=server.serve_forever, name="mjpeg-server", daemon=True).start()
+
+    mqtt_publisher = MqttPublisher(args.mqtt_broker, args.mqtt_port, args.mqtt_topic, args.mqtt_client_id)
+    mqtt_publisher.start()
+    state = DashboardState(stream_url)
+
+    print(f"Input source: {source}")
+    print(f"MJPEG output: {stream_url}")
+    print(f"MQTT topic: {args.mqtt_topic}")
+
+    last_publish = 0.0
+    publish_interval = 1.0 / max(args.publish_hz, 0.1)
+
     try:
-        # Find model
-        model_path = args.model or find_model_path()
-        print(f"Using model: {model_path}\n")
-        
-        # Video mode
-        if args.video:
-            print("=" * 70)
-            print("VIDEO DETECTION MODE - LIVE FEED WITH TRACKING")
-            print("=" * 70)
-            
-            # Validate video file
-            if not os.path.exists(args.video):
-                print(f"Error: Video file not found: {args.video}")
-                sys.exit(1)
-            
-            # Set default output path if not specified
-            output_path = args.output or "outputs/output.mp4"
-            
-            # Run detection with tracking and configurable IOU
-            results = detect_video(
-                video_path=args.video,
-                model_path=model_path,
-                output_path=output_path,
-                confidence_threshold=args.confidence,
-                meters_per_pixel=args.meters_per_pixel,
-                target_length=args.target_length,
-                iou_threshold=args.iou,
-                track_buffer=args.track_buffer,
-                show_live=display_enabled
+        stream = detect_video_stream(
+            source,
+            str(model_path),
+            confidence_threshold=args.confidence,
+            iou_threshold=args.iou,
+            track_buffer=args.track_buffer,
+            target_length=TARGET_LENGTH_M,
+            loop_video=args.loop_video and not is_live_source,
+        )
+
+        for item in stream:
+            if stop_event.is_set():
+                break
+            if item.get("source_reset"):
+                state.reset_cut_edges()
+
+            detections = item["detections"]
+            annotated = draw_bounding_boxes(
+                item["frame"].copy(),
+                detections,
+                item["roi_config"],
+                frame_width=item["frame_width"],
+                frame_height=item["frame_height"],
+                meters_per_pixel=item["meters_per_pixel"],
             )
-            
-            # Print results
-            print("\n" + "=" * 70)
-            print("DETECTION & TRACKING RESULTS")
-            print("=" * 70)
-            print(f"Total frames processed: {results['total_frames']}")
-            print(f"Total detections: {results['total_detections']}")
-            print(f"Unique tracked IDs: {len(results['unique_track_ids'])}")
-            print(f"Average FPS: {results['fps_avg']:.2f}")
-            print(f"\nTracking Configuration:")
-            print(f"  IOU threshold: {args.iou}")
-            print(f"  Meters per pixel: {args.meters_per_pixel:.6f}")
-            print(f"  Target length: {args.target_length:.2f}m")
-            print(f"\nProcessed video saved to: {output_path}")
-            print("=" * 70)
-        
-        # Camera mode
-        elif args.camera:
-            print("=" * 70)
-            print("CAMERA DETECTION MODE - LIVE FEED")
-            print("=" * 70)
-            
-            results = detect_camera(
-                model_path=model_path,
-                camera_id=args.camera_id,
-                confidence_threshold=args.confidence,
-                reference_pixel_to_cm=args.pixel_to_cm,
-                max_frames=args.max_frames
+            annotated = add_header_overlay(
+                annotated,
+                total_detections=len(detections),
+                unique_tracks=item["unique_tracks"],
+                target_length=TARGET_LENGTH_M,
+                fps=item["fps"],
             )
-            
-            # Print results
-            print("\n" + "=" * 70)
-            print("DETECTION RESULTS")
-            print("=" * 70)
-            print(f"Total frames processed: {results['total_frames']}")
-            print(f"Total detections: {results['total_detections']}")
-            print(f"Average detections per frame: {results['avg_detections_per_frame']:.2f}")
-            print(f"Frames saved: {results['frames_saved']}")
-            print("=" * 70)
-    
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except RuntimeError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+            frame_store.update(annotated)
+
+            payload = state.payload(detections, item["fps"], mqtt_publisher.connected)
+            now = time.monotonic()
+            if payload["cut_signal"] or now - last_publish >= publish_interval:
+                mqtt_publisher.publish(payload)
+                last_publish = now
+
+            if args.show:
+                cv2.imshow("Steel Bar Detector IoT", annotated)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    finally:
+        stop_event.set()
+        mqtt_publisher.stop()
+        server.shutdown()
+        server.server_close()
+        if args.show:
+            cv2.destroyAllWindows()
 
 
-if __name__ == '__main__':
-    main()
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Steel bar detector IoT bridge for FlowFuse/Node-RED.")
+    parser.add_argument("--source", default=str(DEFAULT_SOURCE), help="Video path, camera index, or stream URL.")
+    parser.add_argument("--model", default=str(DEFAULT_MODEL), help="YOLOv8 model path.")
+    parser.add_argument("--confidence", type=float, default=0.5, help="YOLO confidence threshold.")
+    parser.add_argument("--iou", type=float, default=0.45, help="YOLO NMS IoU threshold.")
+    parser.add_argument("--track-buffer", type=int, default=60, help="BoTSORT track buffer.")
+    parser.add_argument("--mqtt-broker", default="localhost", help="MQTT broker host.")
+    parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port.")
+    parser.add_argument("--mqtt-topic", default=MQTT_TOPIC, help="MQTT data topic.")
+    parser.add_argument("--mqtt-client-id", default="steel-bar-detector-iot", help="MQTT client id.")
+    parser.add_argument("--stream-host", default="0.0.0.0", help="MJPEG bind host.")
+    parser.add_argument("--stream-port", type=int, default=8081, help="MJPEG bind port.")
+    parser.add_argument("--stream-public-host", default=None, help="Host/IP published in streamUrl.")
+    parser.add_argument("--stream-url", default=None, help="Full streamUrl override published to MQTT.")
+    parser.add_argument("--publish-hz", type=float, default=4.0, help="MQTT publish frequency.")
+    parser.add_argument("--jpeg-quality", type=int, default=85, help="MJPEG JPEG quality.")
+    parser.add_argument("--loop-video", action="store_true", help="Loop local video files for demos.")
+    parser.add_argument("--show", action="store_true", help="Show local OpenCV preview window.")
+    return parser
+
+
+if __name__ == "__main__":
+    run(build_parser().parse_args())

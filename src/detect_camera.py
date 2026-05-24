@@ -174,8 +174,10 @@ class CameraDetector:
                     break
                 elif key == ord('s'):
                     # Save frame with detections
-                    save_path = f"outputs/camera_frame_{frame_count}.jpg"
-                    cv2.imwrite(save_path, annotated_frame)
+                    output_dir = Path("outputs")
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    save_path = output_dir / f"camera_frame_{frame_count}.jpg"
+                    cv2.imwrite(str(save_path), annotated_frame)
                     print(f"Frame saved to: {save_path}")
                     saved_frames += 1
                 

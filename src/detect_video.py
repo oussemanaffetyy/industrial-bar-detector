@@ -9,12 +9,11 @@ Features:
 """
 
 import cv2
-import os
 import sys
 from pathlib import Path
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
 from ultralytics import YOLO
@@ -239,7 +238,8 @@ class VideoDetector:
         Returns:
             Dict with processing statistics
         """
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        output_path = Path(output_path).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -263,7 +263,7 @@ class VideoDetector:
         self.meters_per_pixel = roi_init['meters_per_pixel']
         
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
         
         stats = {
             'total_frames': 0,
@@ -496,3 +496,271 @@ def detect_video(
     )
     
     return detector.process_video(video_path, output_path, show_live=show_live)
+
+
+def detect_video_stream(
+    video_path: Union[str, int],
+    model_path: str,
+    confidence_threshold: float = 0.4,
+    iou_threshold: float = 0.45,
+    track_buffer: int = 60,
+    meters_per_pixel: float = None,
+    target_length: float = 3.0,
+    loop_video: bool = False,
+):
+    """
+    Generator function for real-time video detection streaming.
+    Yields raw frames, processed detections, and measurement metadata for each
+    frame to enable live streaming and IoT integration.
+    
+    Args:
+        video_path: Path, camera index, or stream URL accepted by OpenCV
+        model_path: Path to YOLOv8 weights
+        confidence_threshold: Detection confidence threshold
+        iou_threshold: NMS IoU threshold
+        track_buffer: ByteTrack memory (frames)
+        meters_per_pixel: Calibration factor (auto-calculated if None)
+        target_length: Target bar length in meters
+        loop_video: Restart file sources when the end is reached
+        
+    Yields:
+        Dict: Frame, detections, ROI metadata, and FPS for the current frame
+    """
+    cap = None
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+        
+        detector = VideoDetector(
+            model_path,
+            confidence_threshold=confidence_threshold,
+            iou_threshold=iou_threshold,
+            track_buffer=track_buffer,
+            meters_per_pixel=meters_per_pixel or 0.009890,
+            target_length=target_length
+        )
+        
+        frame_idx = 0
+        roi_initialized = False
+        roi_config = None
+        frame_times = deque(maxlen=30)
+        source_reset = False
+        
+        while True:
+            frame_start = datetime.now()
+            ret, frame = cap.read()
+            if not ret:
+                if loop_video:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    detector.motion_tracker = MotionTracker()
+                    detector.length_smoother = LengthSmoother(window_size=30)
+                    detector.unique_ids.clear()
+                    detector.max_id = 0
+                    frame_idx = 0
+                    source_reset = True
+                    continue
+                break
+            
+            if not roi_initialized:
+                frame_h, frame_w = frame.shape[:2]
+                from src.measure_length import initialize_roi_config
+                roi_init = initialize_roi_config(frame_w, frame_h)
+                roi_config = calculate_measurement_roi(frame_h)
+                detector.meters_per_pixel = roi_init['meters_per_pixel']
+                detector.roi_config = roi_config
+                detector.frame_height = frame_h
+                detector.frame_width = frame_w
+                roi_initialized = True
+            
+            frame_h, frame_w = frame.shape[:2]
+            results = detector.model.track(
+                frame,
+                conf=detector.confidence_threshold,
+                iou=detector.iou_threshold,
+                tracker="botsort.yaml",
+                persist=True,
+                device=0 if detector._has_cuda() else 'cpu',
+                verbose=False
+            )
+            
+            detections = detector.get_detections(results, frame.shape)
+            detections = estimate_bar_length(
+                detections,
+                detector.meters_per_pixel,
+                roi_config,
+                frame_width=frame_w,
+                frame_height=frame_h
+            )
+            detections_in_zone = [d for d in detections if d.get('in_valid_zone', True)]
+            detections_in_zone, _ = detector.motion_tracker.update(
+                results,
+                detections_in_zone,
+                frame_idx
+            )
+
+            for det in detections_in_zone:
+                track_id = det.get('track_id')
+                if track_id is None or not det.get('in_measurement_roi', True):
+                    continue
+
+                detector.length_smoother.add_measurement(
+                    int(track_id),
+                    float(det.get('estimated_length_m', 0.0))
+                )
+                smoothed = detector.length_smoother.get_smoothed_length(int(track_id))
+                if smoothed is not None:
+                    det['smoothed_length_m'] = smoothed
+
+                detector.unique_ids.add(int(track_id))
+                detector.max_id = max(detector.max_id, int(track_id))
+
+            frame_elapsed = datetime.now() - frame_start
+            frame_times.append(frame_elapsed)
+            fps = 1 / np.mean([t.total_seconds() for t in frame_times])
+            
+            yield {
+                'frame': frame,
+                'detections': detections_in_zone,
+                'roi_config': roi_config,
+                'frame_width': frame_w,
+                'frame_height': frame_h,
+                'meters_per_pixel': detector.meters_per_pixel,
+                'fps': fps,
+                'unique_tracks': len(detector.unique_ids),
+                'frame_index': frame_idx,
+                'source_reset': source_reset,
+            }
+
+            source_reset = False
+            
+            frame_idx += 1
+    
+    except Exception as e:
+        print(f"Error in detect_video_stream: {e}")
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def _resolve_demo_path(value: str) -> str:
+    """Resolve local paths relative to the project root for standalone demos."""
+    if value.isdigit() or "://" in value:
+        return value
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent.parent / path
+    return str(path.resolve())
+
+
+def _standalone_cut_ready(detections: List[Dict], target_length: float) -> bool:
+    for det in detections:
+        length = det.get('smoothed_length_m') or det.get('estimated_length_m') or 0.0
+        if round(float(length), 2) == round(target_length, 2):
+            return True
+    return False
+
+
+def _draw_standalone_cut_alert(frame: np.ndarray, target_length: float) -> np.ndarray:
+    label = f"CUT ALERT - {target_length:.2f}m"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.1
+    thickness = 3
+    text_size = cv2.getTextSize(label, font, scale, thickness)[0]
+    x = 24
+    y = 72
+
+    cv2.rectangle(
+        frame,
+        (x - 12, y - text_size[1] - 18),
+        (x + text_size[0] + 12, y + 14),
+        (0, 0, 180),
+        -1
+    )
+    cv2.putText(
+        frame,
+        label,
+        (x, y),
+        font,
+        scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA
+    )
+    return frame
+
+
+def run_standalone_demo(args) -> None:
+    """Run the local OpenCV-only demo for PFE presentation Step 1."""
+    source = _resolve_demo_path(args.source)
+    model_path = _resolve_demo_path(args.model)
+
+    if not str(source).isdigit() and "://" not in str(source) and not Path(source).exists():
+        raise FileNotFoundError(f"Source not found: {source}")
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    print("Standalone detection demo")
+    print(f"Source: {source}")
+    print(f"Model: {model_path}")
+    print("Press 'q' or Esc to stop.")
+
+    try:
+        for item in detect_video_stream(
+            int(source) if str(source).isdigit() else source,
+            model_path,
+            confidence_threshold=args.confidence,
+            iou_threshold=args.iou,
+            track_buffer=args.track_buffer,
+            target_length=args.target_length,
+            loop_video=args.loop
+        ):
+            detections = item['detections']
+            frame = draw_bounding_boxes(
+                item['frame'].copy(),
+                detections,
+                item['roi_config'],
+                frame_width=item['frame_width'],
+                frame_height=item['frame_height'],
+                meters_per_pixel=item['meters_per_pixel']
+            )
+            frame = add_header_overlay(
+                frame,
+                total_detections=len(detections),
+                unique_tracks=item['unique_tracks'],
+                target_length=args.target_length,
+                fps=item['fps']
+            )
+
+            if _standalone_cut_ready(detections, args.target_length):
+                frame = _draw_standalone_cut_alert(frame, args.target_length)
+
+            cv2.imshow('El Fouladh - Standalone Test', frame)
+            key = cv2.waitKey(max(args.delay, 1)) & 0xFF
+            if key in (ord('q'), 27):
+                break
+    finally:
+        cv2.destroyAllWindows()
+
+
+def build_standalone_parser():
+    import argparse
+
+    project_root = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser(
+        description="Standalone OpenCV demo for El Fouladh steel bar detection."
+    )
+    parser.add_argument("--source", default=str(project_root / "video.mp4"), help="Video path, camera index, or stream URL.")
+    parser.add_argument("--model", default=str(project_root / "models" / "best.pt"), help="YOLOv8 model path.")
+    parser.add_argument("--confidence", type=float, default=0.5, help="YOLO confidence threshold.")
+    parser.add_argument("--iou", type=float, default=0.45, help="YOLO NMS IoU threshold.")
+    parser.add_argument("--track-buffer", type=int, default=60, help="BoTSORT track buffer.")
+    parser.add_argument("--target-length", type=float, default=3.0, help="Cut target length in meters.")
+    parser.add_argument("--delay", type=int, default=1, help="cv2.waitKey delay in milliseconds.")
+    parser.add_argument("--loop", action="store_true", help="Loop local video files for presentation demos.")
+    return parser
+
+
+if __name__ == "__main__":
+    run_standalone_demo(build_standalone_parser().parse_args())
